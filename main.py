@@ -1,61 +1,123 @@
 import os
 import subprocess
+import json
 import uuid
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+import shutil
+from pathlib import Path
+from fastapi import FastAPI, HTTPException, Response
+from pydantic import BaseModel
 
-app = FastAPI()
+app = FastAPI(title="GalleryDL Microservice", version="1.0")
 
-DOWNLOAD_DIR = "/app/downloads"
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+BASE_TEMP = Path("/tmp/gallerydl")
+BASE_TEMP.mkdir(exist_ok=True)
 
-
-def run_cmd(cmd):
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    print("CMD:", " ".join(cmd))
-    print("STDOUT:", result.stdout)
-    print("STDERR:", result.stderr)
-    return result
+class DownloadRequest(BaseModel):
+    url: str
 
 
-@app.post("/download")
-async def download(url: str):
-    file_id = str(uuid.uuid4())[:8]
-    temp_dir = f"{DOWNLOAD_DIR}/{file_id}"
-    os.makedirs(temp_dir, exist_ok=True)
-
-    # Cookies corretos
-    if "instagram.com" in url:
-        cookie_file = "/app/cookies/instagram.txt"
-    elif "tiktok.com" in url:
-        cookie_file = "/app/cookies/tiktok.txt"
-    else:
-        raise HTTPException(status_code=400, detail="URL não suportada")
-
-    # Comando gallery-dl sem --no-cache
+def run_gallery_dl(url: str, output_dir: Path):
+    """
+    Executa o gallery-dl para baixar arquivos no diretório fornecido.
+    """
     cmd = [
         "gallery-dl",
-        "--cookies", cookie_file,
-        "-o", f"base-directory={temp_dir}",
+        "--ignore-config",
+        "-d", str(output_dir),
         url
     ]
 
-    result = run_cmd(cmd)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr or "Erro desconhecido do gallery-dl")
 
-    if result.returncode != 0:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Erro executando gallery-dl: {result.stderr}"
+    except Exception as e:
+        raise RuntimeError(f"Erro executando gallery-dl: {e}")
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "gallery-dl"}
+
+
+@app.post("/fetch")
+def fetch(req: DownloadRequest):
+    """
+    Retorna metadados sem baixar arquivo (como preview).
+    """
+    cmd = [
+        "gallery-dl",
+        "--ignore-config",
+        "--dump-json",
+        req.url
+    ]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr or "Erro desconhecido")
+
+        metadata = json.loads(proc.stdout)
+        return metadata
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/download")
+def download(req: DownloadRequest):
+    """
+    Baixa o conteúdo e retorna como binário (mp4, jpg, zip).
+    """
+    temp_dir = BASE_TEMP / f"job-{uuid.uuid4()}"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # Executa o download
+        run_gallery_dl(req.url, temp_dir)
+
+        files = list(temp_dir.glob("**/*"))
+
+        if not files:
+            raise HTTPException(status_code=500, detail="Nenhum arquivo foi baixado.")
+
+        # Se tiver mais de 1 arquivo → ZIP
+        if len(files) > 1:
+            zip_path = temp_dir / "gallery.zip"
+            shutil.make_archive(str(zip_path.with_suffix("")), "zip", temp_dir)
+            data = zip_path.read_bytes()
+
+            return Response(
+                content=data,
+                media_type="application/zip",
+                headers={"Content-Disposition": 'attachment; filename="gallery.zip"'}
+            )
+
+        # Apenas 1 arquivo → retorna direto
+        file = files[0]
+        data = file.read_bytes()
+
+        ext = file.suffix.lower()
+        mime = {
+            ".mp4": "video/mp4",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".webp": "image/webp"
+        }.get(ext, "application/octet-stream")
+
+        return Response(
+            content=data,
+            media_type=mime,
+            headers={"Content-Disposition": f'attachment; filename="{file.name}"'}
         )
 
-    files = os.listdir(temp_dir)
-    if not files:
-        raise HTTPException(status_code=500, detail="Nenhum arquivo baixado")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    file_path = os.path.join(temp_dir, files[0])
-
-    return FileResponse(
-        file_path,
-        filename=files[0],
-        media_type="application/octet-stream"
-    )
+    finally:
+        try:
+            shutil.rmtree(temp_dir)
+        except:
+            pass
