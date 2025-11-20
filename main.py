@@ -31,7 +31,6 @@ def build_gallery_cmd(url: str, output_dir: Path) -> list[str]:
         "-d", str(output_dir),
     ]
 
-    # Se for Instagram, usar cookies
     if "instagram.com" in url:
         cmd += ["--cookies", str(INSTAGRAM_COOKIES)]
 
@@ -46,6 +45,7 @@ def run_gallery_dl(url: str, output_dir: Path):
     cmd = build_gallery_cmd(url, output_dir)
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
         print("CMD:", " ".join(cmd))
         print("STDOUT:", proc.stdout)
         print("STDERR:", proc.stderr)
@@ -84,6 +84,7 @@ def fetch(req: DownloadRequest):
 
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
         print("CMD:", " ".join(cmd))
         print("STDOUT:", proc.stdout)
         print("STDERR:", proc.stderr)
@@ -101,51 +102,53 @@ def fetch(req: DownloadRequest):
 @app.post("/download")
 def download(req: DownloadRequest):
     """
-    Baixa o conteúdo e retorna sempre o primeiro arquivo encontrado.
-    Nunca zipa.
+    Baixa o conteúdo completo (carrossel inteiro) e retorna
+    MÚLTIPLOS ITEMS iguais ao node HTTP Request do n8n.
+    Sem ZIP. Sem base64. Apenas binário puro.
     """
     temp_dir = BASE_TEMP / f"job-{uuid.uuid4()}"
     temp_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        # Executa o download
         run_gallery_dl(req.url, temp_dir)
 
-        # Coleta apenas arquivos
-        files = [f for f in temp_dir.glob("**/*") if f.is_file()]
+        # Captura todos os arquivos baixados
+        files = sorted([f for f in temp_dir.glob("**/*") if f.is_file()])
 
         if not files:
             raise HTTPException(status_code=500, detail="Nenhum arquivo foi baixado.")
 
-        # Ordena para ter previsibilidade ao escolher o primeiro
-        files.sort()
+        responses = []
 
-        # Sempre retorna o primeiro arquivo
-        file = files[0]
-        data = file.read_bytes()
+        for file in files:
+            data = file.read_bytes()
 
-        # Detecta MIME
-        ext = file.suffix.lower()
-        mime = {
-            ".mp4": "video/mp4",
-            ".jpg": "image/jpeg",
-            ".jpeg": "image/jpeg",
-            ".png": "image/png",
-            ".webp": "image/webp"
-        }.get(ext, "application/octet-stream")
+            ext = file.suffix.lower()
+            mime = {
+                ".mp4": "video/mp4",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".png": "image/png",
+                ".webp": "image/webp",
+            }.get(ext, "application/octet-stream")
 
-        return Response(
-            content=data,
-            media_type=mime,
-            headers={"Content-Disposition": f'attachment; filename="{file.name}"'}
-        )
+            resp = Response(
+                content=data,
+                media_type=mime,
+                headers={
+                    "Content-Disposition": f'attachment; filename="{file.name}"'
+                }
+            )
 
-    except HTTPException:
-        raise
+            responses.append(resp)
+
+        return responses
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
     finally:
         try:
             shutil.rmtree(temp_dir)
-        except Exception:
+        except:
             pass
