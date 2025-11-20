@@ -3,6 +3,7 @@ import subprocess
 import json
 import uuid
 import shutil
+import base64
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
@@ -13,7 +14,7 @@ BASE_DIR = Path(__file__).resolve().parent
 BASE_TEMP = Path("/tmp/gallerydl")
 BASE_TEMP.mkdir(exist_ok=True)
 
-# caminho do cookie do Instagram dentro da imagem
+# Se estiver usando cookies de Instagram em arquivo instagram.txt na raiz:
 INSTAGRAM_COOKIES = BASE_DIR / "instagram.txt"
 
 
@@ -24,6 +25,7 @@ class DownloadRequest(BaseModel):
 def build_gallery_cmd(url: str, output_dir: Path) -> list[str]:
     """
     Monta o comando do gallery-dl, adicionando cookies se for Instagram.
+    Ajuste/retire a parte de cookies se não estiver usando.
     """
     cmd = [
         "gallery-dl",
@@ -31,8 +33,7 @@ def build_gallery_cmd(url: str, output_dir: Path) -> list[str]:
         "-d", str(output_dir),
     ]
 
-    # Se for Instagram, usar cookies
-    if "instagram.com" in url:
+    if "instagram.com" in url and INSTAGRAM_COOKIES.exists():
         cmd += ["--cookies", str(INSTAGRAM_COOKIES)]
 
     cmd.append(url)
@@ -77,7 +78,7 @@ def fetch(req: DownloadRequest):
         "--dump-json",
     ]
 
-    if "instagram.com" in req.url:
+    if "instagram.com" in req.url and INSTAGRAM_COOKIES.exists():
         cmd += ["--cookies", str(INSTAGRAM_COOKIES)]
 
     cmd.append(req.url)
@@ -101,16 +102,15 @@ def fetch(req: DownloadRequest):
 @app.post("/download")
 def download(req: DownloadRequest):
     """
-    Baixa o conteúdo e retorna como binário (mp4, jpg, zip).
+    Baixa o conteúdo e retorna como binário único.
+    Se tiver mais de 1 arquivo, compacta em ZIP (comportamento antigo).
     """
     temp_dir = BASE_TEMP / f"job-{uuid.uuid4()}"
     temp_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        # Executa o download
         run_gallery_dl(req.url, temp_dir)
 
-        # Só arquivos, nada de diretório
         files = [f for f in temp_dir.glob("**/*") if f.is_file()]
 
         if not files:
@@ -125,7 +125,7 @@ def download(req: DownloadRequest):
             return Response(
                 content=data,
                 media_type="application/zip",
-                headers={"Content-Disposition": 'attachment; filename="gallery.zip"'}
+                headers={"Content-Disposition": 'attachment; filename=\"gallery.zip\"'}
             )
 
         # Apenas 1 arquivo → retorna direto
@@ -144,7 +144,7 @@ def download(req: DownloadRequest):
         return Response(
             content=data,
             media_type=mime,
-            headers={"Content-Disposition": f'attachment; filename="{file.name}"'}
+            headers={"Content-Disposition": f'attachment; filename=\"{file.name}\"'}
         )
 
     except HTTPException:
@@ -152,7 +152,54 @@ def download(req: DownloadRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        try:
-            shutil.rmtree(temp_dir)
-        except Exception:
-            pass
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+@app.post("/download_multi")
+def download_multi(req: DownloadRequest):
+    """
+    Versão 'solta' (sem ZIP):
+    - Baixa todas as mídias
+    - Retorna JSON com uma entrada por arquivo, em base64
+    - Ideal para n8n criar vários items, igual era com o Instaloader
+    """
+    temp_dir = BASE_TEMP / f"job-{uuid.uuid4()}"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        run_gallery_dl(req.url, temp_dir)
+
+        files = [f for f in temp_dir.glob("**/*") if f.is_file()]
+        if not files:
+            raise HTTPException(status_code=500, detail="Nenhum arquivo foi baixado.")
+
+        files_sorted = sorted(files, key=lambda f: f.name)
+        response_files = []
+
+        for index, file in enumerate(files_sorted):
+            ext = file.suffix.lower()
+            mime = {
+                ".mp4": "video/mp4",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".png": "image/png",
+                ".webp": "image/webp"
+            }.get(ext, "application/octet-stream")
+
+            raw = file.read_bytes()
+            b64 = base64.b64encode(raw).decode("utf-8")
+
+            response_files.append({
+                "index": index,
+                "filename": file.name,
+                "mime": mime,
+                "size": len(raw),
+                "data_base64": b64,
+            })
+
+        return {"files": response_files}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
