@@ -40,7 +40,7 @@ def build_gallery_cmd(url: str, output_dir: Path | None = None, dump_json=False)
 def fetch(req: DownloadRequest):
     """
     Retorna TODOS os metadados exatamente como o gallery-dl entrega,
-    incluindo TODOS os itens do carrossel.
+    ignorando warnings e linhas inválidas.
     """
     cmd = build_gallery_cmd(req.url, dump_json=True)
 
@@ -52,18 +52,32 @@ def fetch(req: DownloadRequest):
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr or "Erro desconhecido")
 
-        # gallery-dl pode retornar múltiplas linhas JSON
-        lines = [json.loads(l) for l in proc.stdout.splitlines() if l.strip()]
+        json_objects = []
 
-        # se tiver apenas 1, retorna direto
-        if len(lines) == 1:
-            return lines[0]
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                json_objects.append(obj)
+            except json.JSONDecodeError:
+                # ignora warnings do gallery-dl
+                continue
 
-        # se for carrossel sidecar, retornar lista
-        return lines
+        if not json_objects:
+            raise RuntimeError("Nenhum JSON válido retornado pelo gallery-dl")
+
+        # se tiver só um objeto → retorna direto
+        if len(json_objects) == 1:
+            return json_objects[0]
+
+        # senão → carrossel completo
+        return json_objects
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 
