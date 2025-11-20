@@ -1,58 +1,113 @@
-from fastapi import FastAPI, UploadFile
-from fastapi.responses import StreamingResponse
-from starlette.responses import Response
-from starlette.datastructures import UploadFile, Headers
-from starlette.responses import MultipartResponse
-import mimetypes
+import os
+import subprocess
+import json
+import uuid
+import shutil
+from pathlib import Path
+from fastapi import FastAPI, HTTPException, Response
+from pydantic import BaseModel
+
+app = FastAPI(title="GalleryDL Microservice", version="1.0")
+
+BASE_DIR = Path(__file__).resolve().parent
+BASE_TEMP = Path("/tmp/gallerydl")
+BASE_TEMP.mkdir(exist_ok=True)
+
+INSTAGRAM_COOKIES = BASE_DIR / "instagram.txt"
+
+
+class DownloadRequest(BaseModel):
+    url: str
+
+
+def build_gallery_cmd(url: str, output_dir: Path | None = None, dump_json=False):
+    cmd = ["gallery-dl", "--ignore-config"]
+
+    if dump_json:
+        cmd.append("--dump-json")
+
+    if output_dir:
+        cmd += ["-d", str(output_dir)]
+
+    if "instagram.com" in url:
+        cmd += ["--cookies", str(INSTAGRAM_COOKIES)]
+
+    cmd.append(url)
+    return cmd
+
+
+@app.post("/fetch")
+def fetch(req: DownloadRequest):
+    """
+    Retorna TODOS os metadados exatamente como o gallery-dl entrega,
+    incluindo TODOS os itens do carrossel.
+    """
+    cmd = build_gallery_cmd(req.url, dump_json=True)
+
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=60
+        )
+
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr or "Erro desconhecido")
+
+        # gallery-dl pode retornar múltiplas linhas JSON
+        lines = [json.loads(l) for l in proc.stdout.splitlines() if l.strip()]
+
+        # se tiver apenas 1, retorna direto
+        if len(lines) == 1:
+            return lines[0]
+
+        # se for carrossel sidecar, retornar lista
+        return lines
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 
 @app.post("/download")
 def download(req: DownloadRequest):
     """
-    Retorna TODOS os arquivos como multipart/form-data,
-    ideal para n8n (Split Out).
-    Sem ZIP, sem base64.
+    DOWNLOAD DE APENAS 1 ITEM.
+    O n8n usará /fetch → obterá media_url → HTTP Request → download binário.
     """
     temp_dir = BASE_TEMP / f"job-{uuid.uuid4()}"
     temp_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        # Baixa tudo
-        run_gallery_dl(req.url, temp_dir)
+        cmd = build_gallery_cmd(req.url, output_dir=temp_dir)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
 
-        files = sorted([f for f in temp_dir.glob("**/*") if f.is_file()])
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr)
 
+        # pega apenas 1 arquivo (uso interno)
+        files = [f for f in temp_dir.glob("**/*") if f.is_file()]
         if not files:
-            raise HTTPException(status_code=500, detail="Nenhum arquivo foi baixado.")
+            raise HTTPException(status_code=500, detail="Nenhum arquivo baixado.")
 
-        # Construir partes multipart
-        parts = []
+        file = files[0]
+        data = file.read_bytes()
 
-        boundary = "X-GALLERY-BOUNDARY"
-
-        body = b""
-
-        for file in files:
-            data = file.read_bytes()
-            mime = mimetypes.guess_type(file.name)[0] or "application/octet-stream"
-
-            body += (
-                f"--{boundary}\r\n"
-                f"Content-Disposition: form-data; name=\"file\"; filename=\"{file.name}\"\r\n"
-                f"Content-Type: {mime}\r\n\r\n"
-            ).encode("utf-8") + data + b"\r\n"
-
-        body += f"--{boundary}--\r\n".encode("utf-8")
+        ext = file.suffix.lower()
+        mime = {
+            ".mp4": "video/mp4",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".webp": "image/webp",
+        }.get(ext, "application/octet-stream")
 
         return Response(
-            content=body,
-            media_type=f"multipart/form-data; boundary={boundary}"
+            content=data,
+            media_type=mime,
+            headers={"Content-Disposition": f'attachment; filename="{file.name}"'}
         )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
-        try:
-            shutil.rmtree(temp_dir)
-        except:
-            pass
+        shutil.rmtree(temp_dir, ignore_errors=True)
