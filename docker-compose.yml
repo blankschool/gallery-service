@@ -1,0 +1,27 @@
+version: "3.9"
+
+services:
+  gallerydl:
+    build: .
+    container_name: gallerydl_service
+    restart: always
+
+    # Porta onde o microserviço vai rodar internamente
+    ports:
+      - "8003:8003"
+
+    environment:
+      # Caso queira colocar token mais tarde
+      # GALLERYDL_TOKEN: "seu_token_aqui"
+      PYTHONUNBUFFERED: 1
+
+    # Se quiser logs persistentes
+    volumes:
+      - ./logs:/app/logs
+
+    # Garante que não vai travar por limite de memória
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
